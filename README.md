@@ -40,7 +40,8 @@ The gems it manages are listed in [`gems.txt`](gems.txt):
 bin/release-jekyll-gems [options] [repo=version ...]
 
   -n, --dry-run     Print the plan and run read-only checks; write nothing
-  -y, --yes         Don't ask for confirmation before each tag
+  -y, --yes         Don't ask for confirmation before each tag; required
+                    when run without a TTY (e.g. from an editor or a `!` prompt)
   -w, --watch       Wait for release workflow runs to finish (gh run watch)
   -o, --only REPO   Only process REPO (name or owner/name); repeatable
       --no-sign     Create annotated tags (git tag -a) instead of signed ones
@@ -59,7 +60,7 @@ bin/release-jekyll-gems --only jekyll-remote-theme jekyll-remote-theme=0.6.3
 bin/release-jekyll-gems --yes --watch
 ```
 
-Without `--yes`, the script asks before each tag, reading the answer from `/dev/tty`.
+Without `--yes`, the script asks before each tag, reading the answer from `/dev/tty`. When there's no terminal to read from (for example, when it runs from an editor, a `!` shell prompt, or CI), pass `--yes`; otherwise each gem that's ready to tag fails with "no terminal to confirm".
 
 ### What it does per gem
 
