@@ -46,7 +46,8 @@ heading; the version isn't on RubyGems; the tag doesn't exist.
 
 Options:
   -n, --dry-run     Print the plan and run read-only checks; write nothing
-  -y, --yes         Don't ask for confirmation before each tag
+  -y, --yes         Don't ask for confirmation before each tag; required
+                    when run without a TTY (e.g. from an editor or a ! prompt)
   -w, --watch       Wait for release workflow runs to finish (gh run watch)
   -o, --only REPO   Only process REPO (name or owner/name); repeatable
       --no-sign     Create annotated tags (git tag -a) instead of signed ones
@@ -504,7 +505,7 @@ process_gem() {  # repo
   case "$rc" in
     0) ;;
     1) set_result "tag" "skipped" "declined at prompt"; warn "skipped"; return 0 ;;
-    *) fail "tag" "can't read confirmation from $RELEASE_TTY (use --yes)"; return 1 ;;
+    *) fail "tag" "no terminal to confirm ($RELEASE_TTY unreadable); rerun with --yes to tag non-interactively"; return 1 ;;
   esac
 
   if ! create_tag "$repo" "$tag" "$sha" "$gem" "$version"; then

@@ -82,7 +82,8 @@ load test_helper
   add_gem jekyll-foo 1.2.3
   RELEASE_TTY="$BATS_TEST_TMPDIR/missing/tty" run_script
   assert_failure 1
-  assert_output --partial "use --yes"
+  assert_output --partial "no terminal to confirm"
+  assert_output --partial "rerun with --yes to tag non-interactively"
   refute_called "^git "
 }
 
