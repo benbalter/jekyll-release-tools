@@ -1,0 +1,9 @@
+# Gems released by bin/release-jekyll-gems, one owner/repo per line.
+# The repo name must match the gem name on RubyGems.
+benbalter/jekyll-remote-theme
+benbalter/jekyll-include-cache
+benbalter/jekyll-relative-links
+benbalter/jekyll-titles-from-headings
+benbalter/jekyll-optional-front-matter
+benbalter/jekyll-readme-index
+benbalter/jekyll-default-layout

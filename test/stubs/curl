@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Fake curl for tests: serves $RUBYGEMS_DIR/<gem>.json for
+# .../versions/<gem>.json, or a 404. Honors -o and -w '%{http_code}'.
+printf 'curl %s\n' "$*" >>"$CALLS_LOG"
+out="" write="" url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    -w) write="$2"; shift ;;
+    -*) ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+[ -f "$RUBYGEMS_DIR/fail" ] && { echo "curl: (6) Could not resolve host" >&2; exit 6; }
+gem="${url##*/versions/}"; gem="${gem%.json}"
+if [ -f "$RUBYGEMS_DIR/$gem.json" ]; then
+  code=200; body="$(cat "$RUBYGEMS_DIR/$gem.json")"
+else
+  code=404; body="This rubygem could not be found."
+fi
+if [ -n "$out" ]; then printf '%s' "$body" >"$out"; else printf '%s' "$body"; fi
+[ -n "$write" ] && printf '%s' "${write//%\{http_code\}/$code}"
+exit 0

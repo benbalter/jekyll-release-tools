@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fake git for tests: records calls; fails the subcommand named in
+# $GIT_STUB_FAIL (e.g. "push").
+printf 'git %s\n' "$*" >>"$CALLS_LOG"
+args=("$@")
+[ "${args[0]}" = "-C" ] && args=("${args[@]:2}")
+if [ -n "${GIT_STUB_FAIL:-}" ] && [ "${args[0]}" = "$GIT_STUB_FAIL" ]; then
+  echo "git stub: $GIT_STUB_FAIL failed" >&2
+  exit 1
+fi
+exit 0

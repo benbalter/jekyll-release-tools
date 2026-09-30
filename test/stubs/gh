@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Fake gh for tests. Serves JSON/raw fixtures from $REMOTE_DIR/<repo-name>/
+# and applies --jq with the real jq, like gh does.
+set -uo pipefail
+printf 'gh %s\n' "$*" >>"$CALLS_LOG"
+
+not_found() { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+
+JQ="" REPO="" POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --jq) JQ="$2"; shift ;;
+    --repo|-R) REPO="$2"; shift ;;
+    -H|--json|--workflow|--branch|--limit|--event) shift ;;
+    --paginate|--exit-status) ;;
+    *) POS+=("$1") ;;
+  esac
+  shift
+done
+
+emit() {  # json
+  if [ -n "$JQ" ]; then printf '%s' "$1" | jq -r "$JQ"; else printf '%s\n' "$1"; fi
+}
+
+case "${POS[0]} ${POS[1]:-}" in
+  "auth status") exit 0 ;;
+  "repo view")
+    d="$REMOTE_DIR/${POS[2]#*/}"
+    [ -f "$d/branch" ] || { echo "GraphQL: Could not resolve to a Repository" >&2; exit 1; }
+    emit "{\"defaultBranchRef\":{\"name\":\"$(cat "$d/branch")\"}}"
+    ;;
+  "release view")
+    d="$REMOTE_DIR/${REPO#*/}"
+    [ -f "$d/release" ] || { echo "release not found" >&2; exit 1; }
+    emit '{"tagName":"'"${POS[2]}"'"}'
+    ;;
+  "run list")
+    d="$REMOTE_DIR/${REPO#*/}"
+    [ -f "$d/no-workflow" ] && { echo "could not find any workflows named release.yml" >&2; exit 1; }
+    if [ -f "$d/runs.json" ]; then emit "$(cat "$d/runs.json")"; else emit '[]'; fi
+    ;;
+  "run watch")
+    d="$REMOTE_DIR/${REPO#*/}"
+    exit "$(cat "$d/watch-exit" 2>/dev/null || echo 0)"
+    ;;
+  api\ *)
+    path="${POS[1]}"
+    path="${path%%\?*}"
+    # repos/<owner>/<name>/<rest>
+    rest="${path#repos/*/}"; name="${rest%%/*}"; rest="${rest#*/}"
+    d="$REMOTE_DIR/$name"
+    [ -d "$d" ] || not_found
+    case "$rest" in
+      commits/*/check-runs)
+        emit "$(cat "$d/checks.json")" ;;
+      commits/*)
+        emit "{\"sha\":\"$(cat "$d/sha")\"}" ;;
+      git/trees/*)
+        emit "$(cat "$d/tree.json")" ;;
+      git/ref/tags/*)
+        [ -f "$d/tags/${rest#git/ref/tags/}" ] || not_found
+        emit "{\"ref\":\"refs/tags/${rest#git/ref/tags/}\",\"object\":{\"sha\":\"$(cat "$d/sha")\"}}" ;;
+      contents/*)
+        f="$d/files/${rest#contents/}"
+        [ -f "$f" ] || not_found
+        cat "$f" ;;
+      *) echo "gh stub: unhandled api path $path" >&2; exit 1 ;;
+    esac
+    ;;
+  *) echo "gh stub: unhandled command: ${POS[*]}" >&2; exit 1 ;;
+esac

@@ -1,0 +1,554 @@
+#!/usr/bin/env bash
+#
+# release-jekyll-gems: tag releases of Ben Balter's Jekyll plugin gems.
+#
+# Publishing happens in each gem's own `release.yml` GitHub Actions workflow
+# (RubyGems trusted publishing), which runs when a `vX.Y.Z` tag is pushed.
+# This script only decides which gems need a tag, checks they're ready, and
+# pushes a signed tag on the default branch's HEAD commit. It never builds or
+# pushes a gem itself.
+#
+# See README.md or run with --help for details.
+#
+set -euo pipefail
+
+PROG="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GEMS_FILE="${GEMS_FILE:-$SCRIPT_DIR/../gems.txt}"
+RELEASE_TTY="${RELEASE_TTY:-/dev/tty}"
+RUBYGEMS_API="${RUBYGEMS_API:-https://rubygems.org/api/v1}"
+RELEASE_WORKFLOW="${RELEASE_WORKFLOW:-release.yml}"
+# How long to wait for the release workflow run to appear after a tag push
+# when --watch is given (attempts x seconds).
+POLL_ATTEMPTS="${RELEASE_POLL_ATTEMPTS:-12}"
+POLL_INTERVAL="${RELEASE_POLL_INTERVAL:-5}"
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [repo=version ...]
+
+Tag new releases of the gems listed in gems.txt. Pushing a vX.Y.Z tag
+triggers each gem's release.yml workflow, which publishes to RubyGems via
+trusted publishing.
+
+For each gem the script reads the version from lib/**/version.rb on the
+default branch, then checks RubyGems, the tag on GitHub, and the GitHub
+release, and does only what's missing:
+
+  published + tagged      nothing to do (skip)
+  not published, no tag   preflight, then tag default-branch HEAD and push
+  tagged, not published   report the release workflow run (wait with --watch)
+  published, no tag       warn and skip (never tags after the fact)
+
+Preflight before tagging: every check run on the commit completed with
+success, skipped, or neutral; CHANGELOG.md or HISTORY.md has a "## <version>"
+heading; the version isn't on RubyGems; the tag doesn't exist.
+
+Options:
+  -n, --dry-run     Print the plan and run read-only checks; write nothing
+  -y, --yes         Don't ask for confirmation before each tag
+  -w, --watch       Wait for release workflow runs to finish (gh run watch)
+  -o, --only REPO   Only process REPO (name or owner/name); repeatable
+      --no-sign     Create annotated tags (git tag -a) instead of signed ones
+  -h, --help        Show this help
+
+Arguments:
+  repo=version      Guard: fail that gem unless version.rb matches, e.g.
+                    jekyll-remote-theme=0.6.3
+
+Environment:
+  GEMS_FILE         Gem list (default: gems.txt next to bin/)
+
+Requires bash, git, gh (authenticated), curl, and jq.
+EOF
+}
+
+# --- output helpers ---------------------------------------------------------
+
+if [ -t 1 ]; then
+  C_BLUE=$'\033[1;34m' C_YELLOW=$'\033[1;33m' C_GREEN=$'\033[1;32m'
+  C_RED=$'\033[1;31m' C_RESET=$'\033[0m'
+else
+  C_BLUE='' C_YELLOW='' C_GREEN='' C_RED='' C_RESET=''
+fi
+
+log()  { printf '\n%s==> %s%s\n' "$C_BLUE" "$*" "$C_RESET"; }
+info() { printf '    %s\n' "$*"; }
+ok()   { printf '%s  ✓ %s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
+warn() { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
+err()  { printf '%s  ✗ %s%s\n' "$C_RED" "$*" "$C_RESET"; }
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+
+# --- arguments --------------------------------------------------------------
+
+DRY_RUN=0
+ASSUME_YES=0
+WATCH=0
+SIGN=1
+ONLY=()
+GUARDS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes) ASSUME_YES=1 ;;
+    -w|--watch) WATCH=1 ;;
+    --no-sign) SIGN=0 ;;
+    -o|--only)
+      [ $# -ge 2 ] || die "--only needs a repo name"
+      ONLY+=("$2")
+      shift
+      ;;
+    --only=*) ONLY+=("${1#--only=}") ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *=*) GUARDS+=("$1") ;;
+    *) die "unexpected argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+# --- preflight for the script itself ----------------------------------------
+
+for dep in git gh curl jq; do
+  command -v "$dep" >/dev/null 2>&1 || die "$dep not found on PATH"
+done
+gh auth status >/dev/null 2>&1 || die "gh is not authenticated; run: gh auth login"
+[ -r "$GEMS_FILE" ] || die "gem list not found: $GEMS_FILE"
+
+REPOS=()
+while IFS= read -r line || [ -n "$line" ]; do
+  line="${line%%#*}"
+  line="$(printf '%s' "$line" | tr -d '[:space:]')"
+  [ -n "$line" ] || continue
+  case "$line" in
+    */*) REPOS+=("$line") ;;
+    *) die "$GEMS_FILE: expected owner/repo, got: $line" ;;
+  esac
+done <"$GEMS_FILE"
+[ ${#REPOS[@]} -gt 0 ] || die "no gems listed in $GEMS_FILE"
+
+# Does repo (owner/name) match NAME or owner/NAME?
+repo_matches() {
+  [ "$1" = "$2" ] || [ "${1#*/}" = "$2" ]
+}
+
+# Validate --only and guards against the list so typos fail loudly.
+for sel in ${ONLY[@]+"${ONLY[@]}"} ${GUARDS[@]+"${GUARDS[@]}"}; do
+  sel="${sel%%=*}"
+  found=0
+  for repo in "${REPOS[@]}"; do
+    if repo_matches "$repo" "$sel"; then found=1; fi
+  done
+  [ "$found" -eq 1 ] || die "$sel is not in $GEMS_FILE"
+done
+
+selected() {
+  [ ${#ONLY[@]} -eq 0 ] && return 0
+  local sel
+  for sel in "${ONLY[@]}"; do
+    repo_matches "$1" "$sel" && return 0
+  done
+  return 1
+}
+
+# Prints the guarded version for a repo, if any.
+guard_for() {
+  local g
+  for g in ${GUARDS[@]+"${GUARDS[@]}"}; do
+    if repo_matches "$1" "${g%%=*}"; then
+      printf '%s' "${g#*=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/release-jekyll-gems.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+# --- per-gem helpers ----------------------------------------------------------
+#
+# process_gem runs in an `if` context, where bash ignores `set -e`, so every
+# command that can fail is checked explicitly and turned into a FAIL result.
+
+# Result of the current gem, collected into the summary.
+R_VERSION="" R_ACTION="" R_RESULT="" R_DETAIL=""
+
+set_result() {  # action result detail
+  R_ACTION="$1" R_RESULT="$2" R_DETAIL="${3:-}"
+}
+
+fail() {  # action detail
+  set_result "$1" "FAIL" "$2"
+  err "$2"
+  return 1
+}
+
+# gh api GET that distinguishes "404" (exit 3) from other errors (exit 1).
+gh_get() {
+  local out
+  if out="$(gh api "$@" 2>&1)"; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  case "$out" in
+    *"HTTP 404"*|*"Not Found"*) return 3 ;;
+  esac
+  printf '%s\n' "$out" >&2
+  return 1
+}
+
+# Raw file contents at a ref, or exit 3 if the file doesn't exist.
+fetch_file() {  # repo path ref
+  gh_get -H "Accept: application/vnd.github.raw" "repos/$1/contents/$2?ref=$3"
+}
+
+# Finds lib/**/version.rb, preferring lib/<gem>/version.rb.
+find_version_file() {  # repo sha gem
+  local paths path count
+  paths="$(gh_get "repos/$1/git/trees/$2?recursive=1" \
+    --jq '.tree[] | select(.type == "blob") | .path | select(test("^lib/.+/version\\.rb$"))')" || return 1
+  if printf '%s\n' "$paths" | grep -qx "lib/$3/version.rb"; then
+    printf 'lib/%s/version.rb' "$3"
+    return 0
+  fi
+  count="$(printf '%s\n' "$paths" | grep -c . || true)"
+  if [ "$count" -eq 1 ]; then
+    path="$paths"
+    printf '%s' "$path"
+    return 0
+  fi
+  return 1
+}
+
+# Is gem@version on RubyGems? exit 0 = yes, 1 = no, 2 = lookup failed.
+rubygems_has() {  # gem version
+  local body="$WORKDIR/$1.versions.json" code
+  code="$(curl -sS -o "$body" -w '%{http_code}' "$RUBYGEMS_API/versions/$1.json" 2>/dev/null)" || return 2
+  case "$code" in
+    200)
+      if jq -e --arg v "$2" 'any(.[]; .number == $v)' "$body" >/dev/null 2>&1; then
+        return 0
+      fi
+      return 1
+      ;;
+    404) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# Does the tag exist on GitHub? exit 0 = yes, 1 = no, 2 = lookup failed.
+tag_exists() {  # repo tag
+  local rc=0
+  gh_get "repos/$1/git/ref/tags/$2" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    3) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+release_exists() {  # repo tag
+  gh release view "$2" --repo "$1" --json tagName >/dev/null 2>&1
+}
+
+# Checks every check run on the commit. Prints the reason on failure.
+checks_green() {  # repo sha
+  local runs name status conclusion bad="" pending="" total=0
+  if ! runs="$(gh api --paginate "repos/$1/commits/$2/check-runs?per_page=100" \
+    --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv' 2>&1)"; then
+    printf 'could not list check runs: %s' "$runs"
+    return 1
+  fi
+  while IFS=$'\t' read -r name status conclusion; do
+    [ -n "$name" ] || continue
+    total=$((total + 1))
+    if [ "$status" != "completed" ]; then
+      pending="${pending:+$pending, }$name ($status)"
+    else
+      case "$conclusion" in
+        success|skipped|neutral) ;;
+        *) bad="${bad:+$bad, }$name ($conclusion)" ;;
+      esac
+    fi
+  done <<EOF
+$runs
+EOF
+  if [ "$total" -eq 0 ]; then
+    printf 'no check runs found on %s' "${2:0:7}"
+    return 1
+  fi
+  if [ -n "$bad" ]; then
+    printf 'checks not green on %s: %s' "${2:0:7}" "$bad"
+    return 1
+  fi
+  if [ -n "$pending" ]; then
+    printf 'checks still running on %s: %s' "${2:0:7}" "$pending"
+    return 1
+  fi
+  printf '%s check runs green' "$total"
+}
+
+# Finds a "## <version>" heading in CHANGELOG.md or HISTORY.md.
+changelog_has() {  # repo sha version
+  local file content rc esc
+  esc="$(printf '%s' "$3" | sed 's/\./\\./g')"
+  for file in CHANGELOG.md HISTORY.md; do
+    rc=0
+    content="$(fetch_file "$1" "$file" "$2" 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 3 ] && continue
+    if [ "$rc" -ne 0 ]; then
+      printf 'could not read %s' "$file"
+      return 1
+    fi
+    if printf '%s\n' "$content" | grep -Eq "^## \[?v?$esc\]?([[:space:]]|$)"; then
+      printf '%s has ## %s' "$file" "$3"
+      return 0
+    fi
+    printf '%s has no "## %s" heading' "$file" "$3"
+    return 1
+  done
+  printf 'no CHANGELOG.md or HISTORY.md'
+  return 1
+}
+
+# Latest release workflow run for a tag as "id<TAB>status<TAB>conclusion<TAB>url".
+# exit 1 if the workflow can't be listed (e.g. no release.yml yet).
+release_run() {  # repo tag
+  gh run list --repo "$1" --workflow "$RELEASE_WORKFLOW" --branch "$2" --limit 1 \
+    --json databaseId,status,conclusion,url \
+    --jq '.[0] // empty | [.databaseId, .status, .conclusion, .url] | @tsv' 2>/dev/null
+}
+
+# Report on (and optionally wait for) the release run for a tag.
+# Sets the result; returns 1 if the run failed or can't be found.
+follow_release_run() {  # repo tag action
+  local repo="$1" tag="$2" action="$3" run="" id status conclusion url attempt=0
+  while :; do
+    if ! run="$(release_run "$repo" "$tag")"; then
+      fail "$action" "can't list $RELEASE_WORKFLOW runs (does .github/workflows/$RELEASE_WORKFLOW exist?)"
+      return 1
+    fi
+    [ -n "$run" ] && break
+    attempt=$((attempt + 1))
+    if [ "$WATCH" -eq 0 ] || [ "$attempt" -ge "$POLL_ATTEMPTS" ]; then
+      break
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+
+  if [ -z "$run" ]; then
+    if [ "$action" = "tag" ]; then
+      set_result "$action" "ok" "tag pushed; $RELEASE_WORKFLOW run not started yet"
+      warn "no $RELEASE_WORKFLOW run for $tag yet"
+      return 0
+    fi
+    fail "$action" "no $RELEASE_WORKFLOW run found for $tag"
+    return 1
+  fi
+
+  IFS=$'\t' read -r id status conclusion url <<EOF
+$run
+EOF
+  info "release run: $url ($status${conclusion:+, $conclusion})"
+
+  if [ "$status" != "completed" ] && [ "$WATCH" -eq 1 ]; then
+    info "watching run $id..."
+    if gh run watch "$id" --repo "$repo" --exit-status >/dev/null 2>&1; then
+      status="completed" conclusion="success"
+    else
+      status="completed" conclusion="failure"
+    fi
+  fi
+
+  if [ "$status" != "completed" ]; then
+    set_result "$action" "pending" "release run $status: $url"
+    return 0
+  fi
+  if [ "$conclusion" = "success" ]; then
+    set_result "$action" "ok" "release run succeeded: $url"
+    ok "release run succeeded"
+    return 0
+  fi
+  fail "$action" "release run $conclusion: $url"
+}
+
+confirm() {  # prompt
+  local reply=""
+  [ "$ASSUME_YES" -eq 1 ] && return 0
+  printf '  %s [y/N] ' "$1"
+  if ! { read -r reply <"$RELEASE_TTY"; } 2>/dev/null; then
+    printf '\n'
+    return 2
+  fi
+  case "$reply" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+create_tag() {  # repo tag sha gem version
+  local repo="$1" tag="$2" sha="$3" dir mode
+  dir="$(mktemp -d "$WORKDIR/${repo#*/}.XXXXXX")" || return 1
+  if [ "$SIGN" -eq 1 ]; then mode="-s"; else mode="-a"; fi
+  git -C "$dir" init -q &&
+    git -C "$dir" remote add origin "https://github.com/$repo.git" &&
+    git -C "$dir" fetch -q --depth 1 origin "$sha" &&
+    git -C "$dir" tag "$mode" "$tag" -m "$4 $5" "$sha" &&
+    git -C "$dir" push -q --no-follow-tags origin "refs/tags/$tag:refs/tags/$tag"
+}
+
+process_gem() {  # repo
+  local repo="$1" gem="${1#*/}" branch sha vfile vcontent version tag guard
+  local published=0 tagged=0 released=0 rc reason
+
+  log "$gem"
+
+  if ! branch="$(gh repo view "$repo" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)" || [ -z "$branch" ]; then
+    fail "-" "can't read default branch of $repo"
+    return 1
+  fi
+  if ! sha="$(gh_get "repos/$repo/commits/$branch" --jq .sha 2>/dev/null)" || [ -z "$sha" ]; then
+    fail "-" "can't resolve $branch HEAD"
+    return 1
+  fi
+  if ! vfile="$(find_version_file "$repo" "$sha" "$gem")"; then
+    fail "-" "can't find a single lib/**/version.rb on $branch"
+    return 1
+  fi
+  if ! vcontent="$(fetch_file "$repo" "$vfile" "$sha" 2>/dev/null)"; then
+    fail "-" "can't read $vfile"
+    return 1
+  fi
+  version="$(printf '%s\n' "$vcontent" |
+    sed -nE 's/.*VERSION[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']+)["'"'"'].*/\1/p' | head -n 1)"
+  if [ -z "$version" ]; then
+    fail "-" "no VERSION constant in $vfile"
+    return 1
+  fi
+  R_VERSION="$version"
+  tag="v$version"
+  info "$branch @ ${sha:0:7}, $vfile = $version"
+
+  if guard="$(guard_for "$repo")" && [ "$guard" != "$version" ]; then
+    fail "-" "version guard: expected $guard, $vfile has $version"
+    return 1
+  fi
+
+  rc=0; rubygems_has "$gem" "$version" || rc=$?
+  case "$rc" in
+    0) published=1 ;;
+    1) ;;
+    *) fail "-" "RubyGems lookup failed for $gem"; return 1 ;;
+  esac
+  rc=0; tag_exists "$repo" "$tag" || rc=$?
+  case "$rc" in
+    0) tagged=1 ;;
+    1) ;;
+    *) fail "-" "tag lookup failed for $tag"; return 1 ;;
+  esac
+  if [ "$tagged" -eq 1 ] && release_exists "$repo" "$tag"; then released=1; fi
+  info "rubygems: $([ $published -eq 1 ] && echo yes || echo no)," \
+    "tag: $([ $tagged -eq 1 ] && echo yes || echo no)," \
+    "github release: $([ $released -eq 1 ] && echo yes || echo no)"
+
+  # Published and tagged: nothing to do.
+  if [ "$published" -eq 1 ] && [ "$tagged" -eq 1 ]; then
+    if [ "$released" -eq 1 ]; then
+      set_result "skip" "ok" "up to date"
+      ok "$version is published and tagged"
+    else
+      set_result "skip" "warn" "published and tagged, but no GitHub release for $tag"
+      warn "no GitHub release for $tag"
+    fi
+    return 0
+  fi
+
+  # Published but never tagged: don't guess which commit it came from.
+  if [ "$published" -eq 1 ]; then
+    set_result "skip" "warn" "$version is on RubyGems but $tag doesn't exist; tag it by hand if needed"
+    warn "$version is on RubyGems but $tag doesn't exist; not tagging after the fact"
+    return 0
+  fi
+
+  # Tagged but not published: the release workflow should be doing its thing.
+  if [ "$tagged" -eq 1 ]; then
+    follow_release_run "$repo" "$tag" "check"
+    return
+  fi
+
+  # Neither: preflight, then tag.
+  if ! reason="$(checks_green "$repo" "$sha")"; then
+    fail "tag" "$reason"
+    return 1
+  fi
+  ok "$reason"
+  if ! reason="$(changelog_has "$repo" "$sha" "$version")"; then
+    fail "tag" "$reason"
+    return 1
+  fi
+  ok "$reason"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    set_result "tag" "dry-run" "would tag $tag at ${sha:0:7} and push"
+    info "dry run: would create $([ $SIGN -eq 1 ] && echo signed || echo annotated) tag $tag at $sha and push it"
+    return 0
+  fi
+
+  rc=0; confirm "Tag $gem $tag at ${sha:0:7} and push (triggers publish)?" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) set_result "tag" "skipped" "declined at prompt"; warn "skipped"; return 0 ;;
+    *) fail "tag" "can't read confirmation from $RELEASE_TTY (use --yes)"; return 1 ;;
+  esac
+
+  if ! create_tag "$repo" "$tag" "$sha" "$gem" "$version"; then
+    fail "tag" "creating or pushing $tag failed"
+    return 1
+  fi
+  ok "pushed $tag"
+
+  if [ "$WATCH" -eq 1 ]; then
+    follow_release_run "$repo" "$tag" "tag"
+    return
+  fi
+  set_result "tag" "ok" "pushed $tag at ${sha:0:7}; $RELEASE_WORKFLOW will publish"
+}
+
+# --- main ---------------------------------------------------------------------
+
+[ "$DRY_RUN" -eq 1 ] && log "Dry run: nothing will be tagged or pushed"
+
+S_GEM=() S_VER=() S_ACTION=() S_RESULT=() S_DETAIL=()
+FAILURES=0
+
+for repo in "${REPOS[@]}"; do
+  selected "$repo" || continue
+  R_VERSION="-" R_ACTION="-" R_RESULT="FAIL" R_DETAIL="unknown error"
+  if ! process_gem "$repo"; then
+    R_RESULT="FAIL"
+  fi
+  [ "$R_RESULT" = "FAIL" ] && FAILURES=$((FAILURES + 1))
+  S_GEM+=("${repo#*/}")
+  S_VER+=("$R_VERSION")
+  S_ACTION+=("$R_ACTION")
+  S_RESULT+=("$R_RESULT")
+  S_DETAIL+=("$R_DETAIL")
+done
+
+log "Summary"
+fmt='%-30s %-9s %-6s %-8s %s\n'
+# shellcheck disable=SC2059
+printf "$fmt" GEM VERSION ACTION RESULT DETAIL
+i=0
+while [ "$i" -lt ${#S_GEM[@]} ]; do
+  # shellcheck disable=SC2059
+  printf "$fmt" "${S_GEM[$i]}" "${S_VER[$i]}" "${S_ACTION[$i]}" "${S_RESULT[$i]}" "${S_DETAIL[$i]}"
+  i=$((i + 1))
+done
+
+if [ "$FAILURES" -gt 0 ]; then
+  printf '\n%d gem(s) failed.\n' "$FAILURES"
+  exit 1
+fi
