@@ -313,12 +313,14 @@ changelog_has() {  # repo sha version
   return 1
 }
 
-# Latest release workflow run for a tag as "id<TAB>status<TAB>conclusion<TAB>url".
+# Latest release workflow run for a tag as "id<TAB>status<TAB>url<TAB>conclusion".
+# Conclusion is last because it's empty while a run is in progress, and read
+# would collapse the empty field between tabs.
 # exit 1 if the workflow can't be listed (e.g. no release.yml yet).
 release_run() {  # repo tag
   gh run list --repo "$1" --workflow "$RELEASE_WORKFLOW" --branch "$2" --limit 1 \
     --json databaseId,status,conclusion,url \
-    --jq '.[0] // empty | [.databaseId, .status, .conclusion, .url] | @tsv' 2>/dev/null
+    --jq '.[0] // empty | [.databaseId, .status, .url, .conclusion] | @tsv' 2>/dev/null
 }
 
 # Report on (and optionally wait for) the release run for a tag.
@@ -348,7 +350,7 @@ follow_release_run() {  # repo tag action
     return 1
   fi
 
-  IFS=$'\t' read -r id status conclusion url <<EOF
+  IFS=$'\t' read -r id status url conclusion <<EOF
 $run
 EOF
   info "release run: $url ($status${conclusion:+, $conclusion})"
@@ -389,13 +391,15 @@ confirm() {  # prompt
 }
 
 create_tag() {  # repo tag sha gem version
-  local repo="$1" tag="$2" sha="$3" dir mode
+  local repo="$1" tag="$2" sha="$3" dir
+  local tag_cmd=(tag -s)
+  # tag.gpgSign=true would sign `git tag -a` too, so turn it off explicitly.
+  [ "$SIGN" -eq 1 ] || tag_cmd=(-c tag.gpgSign=false tag -a)
   dir="$(mktemp -d "$WORKDIR/${repo#*/}.XXXXXX")" || return 1
-  if [ "$SIGN" -eq 1 ]; then mode="-s"; else mode="-a"; fi
   git -C "$dir" init -q &&
     git -C "$dir" remote add origin "https://github.com/$repo.git" &&
     git -C "$dir" fetch -q --depth 1 origin "$sha" &&
-    git -C "$dir" tag "$mode" "$tag" -m "$4 $5" "$sha" &&
+    git -C "$dir" "${tag_cmd[@]}" "$tag" -m "$4 $5" "$sha" &&
     git -C "$dir" push -q --no-follow-tags origin "refs/tags/$tag:refs/tags/$tag"
 }
 

@@ -60,7 +60,7 @@ load test_helper
   add_gem jekyll-foo 1.2.3
   run_script --yes --no-sign
   assert_success
-  assert_called "^git -C .* tag -a v1\.2\.3 "
+  assert_called "^git -C .* -c tag\.gpgSign=false tag -a v1\.2\.3 "
   refute_called "^git -C .* tag -s "
 }
 
@@ -159,7 +159,7 @@ load test_helper
   set_runs jekyll-foo '[{"databaseId":42,"status":"in_progress","conclusion":"","url":"https://example.test/run/42"}]'
   run_script --yes
   assert_success
-  assert_output --regexp "jekyll-foo +1\.2\.3 +check +pending +release run in_progress"
+  assert_output --regexp "jekyll-foo +1\.2\.3 +check +pending +release run in_progress: https://example\.test/run/42"
   refute_called "^git "
   refute_called "^gh run watch"
 }
