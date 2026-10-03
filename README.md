@@ -25,7 +25,7 @@ The gems it manages are listed in [`gems.txt`](gems.txt):
 
 1. **Open a PR** in the gem's repo that bumps `lib/<gem>/version.rb` and adds a `## X.Y.Z` section to `CHANGELOG.md` (or `HISTORY.md`).
 2. **Merge it** once CI passes.
-3. **Run the script**:
+3. **Run the script**, only after the owner approves the release:
 
    ```sh
    bin/release-jekyll-gems --dry-run   # see the plan
@@ -56,11 +56,11 @@ Examples:
 # Release just remote-theme, and make sure it's the version I think it is
 bin/release-jekyll-gems --only jekyll-remote-theme jekyll-remote-theme=0.6.3
 
-# Tag everything that's ready without prompting, and wait for the publishes
+# Owner only: tag everything that's ready without prompting, and wait for the publishes
 bin/release-jekyll-gems --yes --watch
 ```
 
-Without `--yes`, the script asks before each tag, reading the answer from `/dev/tty`. When there's no terminal to read from (for example, when it runs from an editor, a `!` shell prompt, or CI), pass `--yes`; otherwise each gem that's ready to tag fails with "no terminal to confirm".
+Without `--yes`, the script asks before each tag, reading the answer from `/dev/tty`. When there's no terminal to read from (for example, when it runs from an editor, a `!` shell prompt, or CI), pass `--yes`; otherwise each gem that's ready to tag fails with "no terminal to confirm". Only the owner passes `--yes`, because the prompt is the approval step. AI agents must not pass it, even when asked to run the script; they can run `--dry-run`, which writes nothing.
 
 ### What it does per gem
 
